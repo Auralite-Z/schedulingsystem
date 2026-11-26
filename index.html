@@ -75,7 +75,7 @@ const meta={
  schedule:{title:"Class schedule",table:"class_schedule",cols:[["subject_code","Subject"],["faculty_id","Faculty ID"],["section_id","Section ID"],["room_id","Room ID"],["day_of_week","Day"],["start_time","Start"],["end_time","End"],["term_code","Term"]],fields:[]}
 };
 let mode="signin",page="overview",records={faculty:[],faculty_availability:[],faculty_subject:[],section:[],rooms:[],class_schedule:[]};
-let demoUser=null, scheduleSetupPending=false;
+let demoUser=null, scheduleSetupPending=false, dataReady=false;
 const sample={
  faculty:[{id:"f-1",employee_no:"FAC-001",full_name:"Alex Santos",email:"asantos@campus.edu",department:"Computing",employment_type:"Full-time",max_weekly_hours:18},{id:"f-2",employee_no:"FAC-002",full_name:"Mika Reyes",email:"mreyes@campus.edu",department:"Mathematics",employment_type:"Full-time",max_weekly_hours:18},{id:"f-3",employee_no:"FAC-003",full_name:"Jamie Cruz",email:"jcruz@campus.edu",department:"Computing",employment_type:"Part-time",max_weekly_hours:12}],
  faculty_availability:[{id:"a-1",faculty_id:"f-1",day_of_week:1,start_time:"08:00",end_time:"17:00",availability_type:"preferred"},{id:"a-2",faculty_id:"f-2",day_of_week:2,start_time:"08:00",end_time:"17:00",availability_type:"available"}],
@@ -93,11 +93,17 @@ function sectionName(id){return records.section.find(x=>x.id===id)?.section_code
 function roomName(id){return records.rooms.find(x=>x.id===id)?.room_code||id||"—"}
 function normalizeRow(table,row){let x={...row};if(table==="rooms"&&typeof x.equipment==="string")x.equipment=x.equipment.split(",").map(s=>s.trim()).filter(Boolean);return x}
 function setLoading(on,msg="Loading your workspace…"){$("loadingText").textContent=msg;$("loading").classList.toggle("hidden",!on)}
-async function loadAll(){setLoading(true,"Loading faculty, rooms, sections and schedules…");try{
+async function loadAll(){setLoading(true,"Loading faculty, rooms, sections and schedules…");dataReady=false;try{
  if(DEMO_MODE){records=structuredClone(sample)}
- else {let names=Object.keys(records);let results=await Promise.all(names.map(t=>client.from(t).select("*").limit(1000)));for(let i=0;i<names.length;i++){if(results[i].error)throw results[i].error;records[names[i]]=results[i].data||[]}}
- renderOverview();if(page!=="overview")renderTable();$("connection").textContent=DEMO_MODE?"Demo mode":"Supabase connected";$("connection").classList.toggle("live",!DEMO_MODE);
- }catch(e){toast("Could not load database records: "+e.message);console.error(e)}finally{setLoading(false)}}
+ else {
+   const names=Object.keys(records);
+   const results=await Promise.all(names.map(t=>client.from(t).select("*").limit(1000)));
+   const failed=results.map((r,i)=>r.error?`${names[i]}: ${r.error.message}`:null).filter(Boolean);
+   if(failed.length)throw new Error(failed.join(" | "));
+   for(let i=0;i<names.length;i++)records[names[i]]=(results[i].data||[]).map(r=>normalizeRow(names[i],r));
+ }
+ dataReady=true;renderOverview();if(page!=="overview")renderTable();$("connection").textContent=DEMO_MODE?"Demo mode":"Supabase connected";$("connection").classList.toggle("live",!DEMO_MODE);
+ }catch(e){$("connection").textContent="Database error";$("connection").classList.remove("live");toast("Could not load database records: "+e.message+". Run the updated SQL in Supabase, then refresh.");console.error(e)}finally{setLoading(false)}}
 function renderOverview(){let n=records.class_schedule.length;$("facultyStat").textContent=records.faculty.length;$("scheduleStat").textContent=n;$("roomStat").textContent=records.rooms.length;
  let conflicts=0;records.class_schedule.forEach((a,i)=>records.class_schedule.slice(i+1).forEach(b=>{if(Number(a.day_of_week)===Number(b.day_of_week)&&timeM(a.start_time)<timeM(b.end_time)&&timeM(a.end_time)>timeM(b.start_time)&&(a.faculty_id===b.faculty_id||a.room_id===b.room_id||a.section_id===b.section_id))conflicts++}));$("conflictStat").textContent=conflicts;
  $("progressBar").style.width=(records.faculty.length+records.rooms.length+records.section.length+records.class_schedule.length?100:0)+"%";$("progressText").textContent=`${records.faculty.length} faculty · ${records.rooms.length} rooms · ${records.section.length} sections · ${n} classes loaded`;
@@ -109,16 +115,35 @@ function displayVal(table,row,key){let v=row[key];if(key==="faculty_id"&&table==
 function renderTable(){let cfg=meta[page],rows=page==="schedule"?records.class_schedule:records[cfg.table];$("tableTitle").textContent=cfg.title;$("tableHint").textContent=`${rows.length} records · changes are saved to ${cfg.table}`;$("tableHead").innerHTML="<tr>"+cfg.cols.map(c=>`<th>${c[1]}</th>`).join("")+"<th>Actions</th></tr>";
  let q=$("search").value.toLowerCase();let filtered=rows.filter(r=>JSON.stringify(r).toLowerCase().includes(q));$("recordCount").textContent=`${filtered.length} of ${rows.length} records`;
  $("tableBody").innerHTML=filtered.map(r=>`<tr>${cfg.cols.map(c=>`<td>${esc(displayVal(cfg.table,r,c[0]))}</td>`).join("")}<td><button class="btn" style="padding:6px 9px" onclick="deleteRecord('${cfg.table}','${r.id}')">Delete</button></td></tr>`).join("")||`<tr><td colspan="${cfg.cols.length+1}" class="empty">No matching records. Add a record to get started.</td></tr>`}
-async function insertRow(table,row){if(DEMO_MODE){row.id=row.id||"demo-"+Date.now();records[table].push(row);return {data:row,error:null}}let result=await client.from(table).insert(row).select().single();if(result.error)throw result.error;records[table].push(result.data);return result}
+async function insertRow(table,row){
+ if(DEMO_MODE){row.id=row.id||"demo-"+Date.now();records[table].push(row);return {data:row,error:null}}
+ const result=await client.from(table).insert(row).select("*").single();
+ if(result.error){
+   const msg=result.error.message||"Unknown database error";
+   if(result.error.code==="42501"||/row-level security|permission denied/i.test(msg))throw new Error("Permission denied. Your signed-in account needs an admin or scheduler role in public.user_roles.");
+   if(result.error.code==="PGRST205"||/schema cache|does not exist/i.test(msg))throw new Error(`Table/column mismatch for ${table}. Run the updated FacultyFlow SQL in Supabase and refresh.`);
+   throw result.error;
+ }
+ records[table].push(normalizeRow(table,result.data));return result;
+}
 async function deleteRecord(table,id){if(!confirm("Delete this record? This cannot be undone."))return;try{if(!DEMO_MODE){let {error}=await client.from(table).delete().eq("id",id);if(error)throw error}records[table]=records[table].filter(r=>r.id!==id);renderOverview();if(page!=="overview")renderTable();toast("Record deleted.")}catch(e){toast("Delete failed: "+e.message)}}
 function nextMissingPrerequisite(){return [{page:"faculty",table:"faculty",label:"faculty"},{page:"sections",table:"section",label:"sections"},{page:"rooms",table:"rooms",label:"rooms"}].find(x=>!records[x.table].some(r=>r.active!==false))||null}
-function openSchedule(){let missing=nextMissingPrerequisite();if(missing){scheduleSetupPending=true;navigate(missing.page);toast(`Before scheduling, add at least one ${missing.label}. Complete the setup steps and FacultyFlow will return you here.`);openRecordForm();return}
+function openSchedule(){
+ if(!dataReady){toast("FacultyFlow could not confirm your database records. Check the Supabase connection/schema, then press Refresh before scheduling.");return}
+ const missing=nextMissingPrerequisite();
+ if(missing){
+   scheduleSetupPending=true;
+   navigate(missing.page);
+   const step={faculty:"Step 1 of 3 — Add at least one active faculty member.",sections:"Step 2 of 3 — Add at least one active section.",rooms:"Step 3 of 3 — Add at least one active room."};
+   toast(step[missing.page]+" After saving, FacultyFlow will continue to the next step automatically.");
+   openRecordForm();return;
+ }
  scheduleSetupPending=false;
  $("facultySelect").innerHTML='<option value="">Select faculty</option>'+records.faculty.filter(x=>x.active!==false).map(x=>`<option value="${esc(x.id)}">${esc(x.full_name)}</option>`).join("");
  $("sectionSelect").innerHTML='<option value="">Select section</option>'+records.section.filter(x=>x.active!==false).map(x=>`<option value="${esc(x.id)}">${esc(x.section_code)} (${x.student_count??0} students)</option>`).join("");
  $("roomSelect").innerHTML='<option value="">Select room</option>'+records.rooms.filter(x=>x.active!==false).map(x=>`<option value="${esc(x.id)}">${esc(x.room_code)} · capacity ${x.capacity}</option>`).join("");
- if(!records.faculty.some(x=>x.active!==false)||!records.section.some(x=>x.active!==false)||!records.rooms.some(x=>x.active!==false)){toast("Active faculty, section and room records are required.");return}
- $("scheduleModal").classList.remove("hidden")}
+ $("scheduleModal").classList.remove("hidden");
+}
 function overlapCheck(x){return records.class_schedule.find(s=>Number(s.day_of_week)===Number(x.day_of_week)&&x.start_time<s.end_time&&x.end_time>s.start_time&&(s.faculty_id===x.faculty_id||s.room_id===x.room_id||s.section_id===x.section_id)&&s.status!=="cancelled")}
 $("scheduleForm").addEventListener("submit",async e=>{e.preventDefault();let x={subject_code:$("subjectCode").value.trim(),faculty_id:$("facultySelect").value,section_id:$("sectionSelect").value,room_id:$("roomSelect").value,day_of_week:Number($("daySelect").value),start_time:$("startTime").value,end_time:$("endTime").value,term_code:$("termCode").value.trim(),status:"draft"};if(x.end_time<=x.start_time){toast("End time must be later than start time.");return}
  let conflict=overlapCheck(x);if(conflict){let who=conflict.faculty_id===x.faculty_id?"faculty member":conflict.room_id===x.room_id?"room":"section";toast("Scheduling conflict: this "+who+" already has a class during that time.");return}
@@ -130,8 +155,17 @@ $("scheduleForm").addEventListener("submit",async e=>{e.preventDefault();let x={
  try{await insertRow("class_schedule",x);$("scheduleModal").classList.add("hidden");$("scheduleForm").reset();renderOverview();if(page!=="overview")renderTable();toast("Schedule saved as draft. No overlap detected.")}catch(err){toast("Could not save: "+err.message)}});
 function openRecordForm(){let cfg=meta[page];if(!cfg.fields.length){openSchedule();return} $("recordModalTitle").textContent="Add "+cfg.title.toLowerCase();$("recordFields").innerHTML=cfg.fields.map(([key,label,type])=>`<div class="field"><label>${esc(label)}</label><input name="${esc(key)}" type="${type}" ${type==="number"?'min="0" step="any"':""} required></div>`).join("");$("recordModal").classList.remove("hidden")}
 $("recordForm").addEventListener("submit",async e=>{e.preventDefault();let cfg=meta[page],fd=new FormData(e.target),row={};for(let [key,label,type] of cfg.fields){let v=fd.get(key);if(type==="number")v=Number(v);if(key==="equipment")v=String(v).split(",").map(s=>s.trim()).filter(Boolean);if(key==="accessible")v=String(v).toLowerCase()==="true";row[key]=v}
- try{await insertRow(cfg.table,row);$("recordModal").classList.add("hidden");e.target.reset();renderOverview();renderTable();toast("Record added successfully.");if(scheduleSetupPending){let missing=nextMissingPrerequisite();if(missing){navigate(missing.page);toast(`Next step: add ${missing.label}.`);openRecordForm()}else{scheduleSetupPending=false;navigate("schedule");toast("Setup complete. Now create your class schedule.");openSchedule()}}}catch(err){toast("Could not save: "+err.message)}});
-$("create").onclick=()=>page==="overview"||page==="schedule"?openSchedule():openRecordForm();$("addRecord").onclick=openRecordForm;$("cancelSchedule").onclick=()=>$("scheduleModal").classList.add("hidden");$("cancelRecord").onclick=()=>{$("recordModal").classList.add("hidden");scheduleSetupPending=false};$("search").addEventListener("input",renderTable);$("refresh").onclick=loadAll;
+ try{
+   await insertRow(cfg.table,row);
+   $("recordModal").classList.add("hidden");e.target.reset();renderOverview();renderTable();toast("Record added successfully.");
+   if(scheduleSetupPending){
+     const missing=nextMissingPrerequisite();
+     if(missing){navigate(missing.page);toast(`Next step: add ${missing.label}.`);openRecordForm()}
+     else{scheduleSetupPending=false;navigate("schedule");toast("Setup complete. Faculty, sections and rooms are ready. Create your class schedule.");openSchedule()}
+   }
+ }catch(err){toast("Could not save: "+err.message)}
+});
+$("create").onclick=()=>page==="overview"||page==="schedule"?openSchedule():openRecordForm();$("addRecord").onclick=openRecordForm;$("cancelSchedule").onclick=()=>$("scheduleModal").classList.add("hidden");$("cancelRecord").onclick=()=>{$("recordModal").classList.add("hidden");scheduleSetupPending=false;toast("Scheduling setup paused. Click New schedule when you are ready to continue.")};$("search").addEventListener("input",renderTable);$("refresh").onclick=loadAll;
 $("export").onclick=()=>{let rows=page==="overview"?records.class_schedule:records[meta[page].table],cols=page==="overview"?meta.schedule.cols:meta[page].cols;let csv=[cols.map(c=>c[1]).join(","),...rows.map(r=>cols.map(c=>'"'+String(displayVal(page==="overview"?"class_schedule":meta[page].table,r,c[0])).replaceAll('"','""')+'"').join(","))].join("\n");let a=document.createElement("a");a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));a.download=(page==="overview"?"class-schedule":page)+"-export.csv";a.click();URL.revokeObjectURL(a.href)};
 document.querySelectorAll(".nav button").forEach(b=>b.addEventListener("click",()=>navigate(b.dataset.page)));
 function showAuth(){ $("app").classList.add("hidden");$("auth").classList.remove("hidden")}
