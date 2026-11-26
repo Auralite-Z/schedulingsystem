@@ -115,12 +115,24 @@ function displayVal(table,row,key){let v=row[key];if(key==="faculty_id"&&table==
 function renderTable(){let cfg=meta[page],rows=page==="schedule"?records.class_schedule:records[cfg.table];$("tableTitle").textContent=cfg.title;$("tableHint").textContent=`${rows.length} records · changes are saved to ${cfg.table}`;$("tableHead").innerHTML="<tr>"+cfg.cols.map(c=>`<th>${c[1]}</th>`).join("")+"<th>Actions</th></tr>";
  let q=$("search").value.toLowerCase();let filtered=rows.filter(r=>JSON.stringify(r).toLowerCase().includes(q));$("recordCount").textContent=`${filtered.length} of ${rows.length} records`;
  $("tableBody").innerHTML=filtered.map(r=>`<tr>${cfg.cols.map(c=>`<td>${esc(displayVal(cfg.table,r,c[0]))}</td>`).join("")}<td><button class="btn" style="padding:6px 9px" onclick="deleteRecord('${cfg.table}','${r.id}')">Delete</button></td></tr>`).join("")||`<tr><td colspan="${cfg.cols.length+1}" class="empty">No matching records. Add a record to get started.</td></tr>`}
+async function permissionDiagnostic(){
+ try{
+   const {data:{user},error:userError}=await client.auth.getUser();
+   if(userError||!user)return {email:"unknown account",id:"unavailable",role:null,detail:userError?.message||"No authenticated user"};
+   const {data:roleRow,error:roleError}=await client.from("user_roles").select("role").eq("user_id",user.id).maybeSingle();
+   return {email:user.email||"no email",id:user.id,role:roleRow?.role||null,detail:roleError?.message||null};
+ }catch(e){return {email:"unknown account",id:"unavailable",role:null,detail:e.message}}
+}
 async function insertRow(table,row){
  if(DEMO_MODE){row.id=row.id||"demo-"+Date.now();records[table].push(row);return {data:row,error:null}}
  const result=await client.from(table).insert(row).select("*").single();
  if(result.error){
    const msg=result.error.message||"Unknown database error";
-   if(result.error.code==="42501"||/row-level security|permission denied/i.test(msg))throw new Error("Permission denied. Your signed-in account needs an admin or scheduler role in public.user_roles.");
+   if(result.error.code==="42501"||/row-level security|permission denied/i.test(msg)){
+     const d=await permissionDiagnostic();
+     if(d.role!=="admin"&&d.role!=="scheduler")throw new Error(`Access denied for ${d.email}. Current account ID: ${d.id}. Detected role: ${d.role||"NO ROLE"}. ${d.detail?"Role lookup error: "+d.detail:"Assign admin or scheduler to THIS exact account ID in Supabase SQL Editor, then sign out and sign in again."}`);
+     throw new Error(`The account ${d.email} has the '${d.role}' role, but Supabase still rejected INSERT on public.${table}. This points to a table GRANT/RLS policy mismatch, not a missing role. Original error: ${msg}`);
+   }
    if(result.error.code==="PGRST205"||/schema cache|does not exist/i.test(msg))throw new Error(`Table/column mismatch for ${table}. Run the updated FacultyFlow SQL in Supabase and refresh.`);
    throw result.error;
  }
